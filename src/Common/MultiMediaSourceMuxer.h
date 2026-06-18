@@ -203,6 +203,11 @@ public:
 
     void addProbe(uint32_t probe_ms, const std::function<void(const std::list<FrameInfo> &info_list)> &cb);
 
+    // Flush cached GOP frames to callback — enables zero-connection snapshots
+    void flushGop(const std::function<void(const Frame::Ptr &)> &cb) const {
+        if (_ring) { _ring->flushGop(cb); }
+    }
+
 protected:
     /////////////////////////////////MediaSink override/////////////////////////////////
 

@@ -359,58 +359,7 @@ void FFmpegSource::onGetMediaSource(const MediaSource::Ptr &src) {
     }
 }
 
-#if defined(ENABLE_FFMPEG)
-#include "Player/MediaPlayer.h"
-#include "Codec/Transcode.h"
-
-static void makeSnapAsync(const string &play_url, const string &save_path, float timeout_sec, const FFmpegSnap::onSnap &cb) {
-    struct Holder {
-        MediaPlayer::Ptr player;
-    };
-    auto holder = std::make_shared<Holder>();
-    auto player = std::make_shared<MediaPlayer>();
-    (*player)[mediakit::Client::kTimeoutMS] = timeout_sec * 1000;
-
-    player->setOnPlayResult([holder, save_path, cb, timeout_sec](const SockException &ex) mutable {
-        onceToken token(nullptr, [&]() { holder->player = nullptr; });
-        auto video = ex ? nullptr : dynamic_pointer_cast<VideoTrack>(holder->player->getTrack(TrackVideo, false));
-        if (!video) {
-            cb(false, ex ? ex.what() : "none video track");
-            return;
-        }
-        auto decoder = std::make_shared<FFmpegDecoder>(video);
-        auto new_holder = std::make_shared<Holder>(*holder);
-        auto timer = EventPollerPool::Instance().getPoller()->doDelayTask(1000 * timeout_sec, [cb, new_holder]() {
-            // 防止解码失败导致播放器无法释放
-            new_holder->player = nullptr;
-            cb(false, "decode frame timeout");
-            return 0;
-        });
-        auto done = false;
-        decoder->setOnDecode([save_path, new_holder, cb, done, timer](const FFmpegFrame::Ptr &frame) mutable {
-            if (done) {
-                return;
-            }
-            onceToken token(nullptr, [&]() { new_holder->player = nullptr; timer->cancel(); done = true; });
-            auto ret = FFmpegUtils::saveFrame(frame, save_path.data());
-            cb(std::get<0>(ret), std::get<1>(ret));
-        });
-        video->addDelegate([decoder](const Frame::Ptr &frame) { return decoder->inputFrame(frame, false, true); });
-    });
-    player->play(play_url);
-    holder->player = std::move(player);
-}
-
-#endif
-
-void FFmpegSnap::makeSnap(bool async, const string &play_url, const string &save_path, float timeout_sec, const onSnap &cb) {
-#if defined(ENABLE_FFMPEG)
-    if (async) {
-        makeSnapAsync(play_url, save_path, timeout_sec, cb);
-        return;
-    }
-#endif
-
+static void makeSnapSync(const string &play_url, const string &save_path, float timeout_sec, const FFmpegSnap::onSnap &cb) {
     GET_CONFIG(string, ffmpeg_bin, FFmpeg::kBin);
     GET_CONFIG(string, ffmpeg_snap, FFmpeg::kSnap);
     GET_CONFIG(string, ffmpeg_log, FFmpeg::kLog);
@@ -453,4 +402,197 @@ void FFmpegSnap::makeSnap(bool async, const string &play_url, const string &save
         bool success = process->exit_code() == 0 && File::fileSize(save_path);
         cb(success, (!success && !log_file.empty()) ? File::loadFile(log_file) : "");
     });
+}
+
+#if defined(ENABLE_FFMPEG)
+#include "Player/MediaPlayer.h"
+#include "Codec/Transcode.h"
+
+// Returns true if the URL host is the local ZLMediaKit instance (127.0.0.1 / localhost / ::1)
+static bool isLocalUrl(const std::string &url) {
+    auto pos = url.find("://");
+    if (pos == std::string::npos) return false;
+    pos += 3;
+    auto end = url.find_first_of("/:?#", pos);
+    auto host = url.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+    return host == "127.0.0.1" || host == "localhost" || host == "::1";
+}
+
+// Strip container extensions from HTTP stream names (.flv .ts .m3u8 .mp4).
+// Only applied for http/https schemas — RTMP/RTSP stream names may legitimately
+// contain dots (e.g. "robot.mp4" pushed over RTMP registers as "robot.mp4").
+static std::string stripStreamExt(const std::string &schema, const std::string &stream) {
+    if (schema != "http" && schema != "https") {
+        return stream;
+    }
+    static const char *exts[] = {".flv", ".ts", ".m3u8", ".mp4", nullptr};
+    for (int i = 0; exts[i]; ++i) {
+        size_t elen = strlen(exts[i]);
+        if (stream.size() > elen && stream.compare(stream.size() - elen, elen, exts[i]) == 0) {
+            return stream.substr(0, stream.size() - elen);
+        }
+    }
+    return stream;
+}
+
+// Fast snapshot path: directly access the GOP cache of an existing local stream.
+// No new network connection is made — uses ZLMediaKit's in-memory frame buffer.
+// Falls back to makeSnapAsync if stream not found or cache empty (always preferred over
+// spawning an external FFmpeg binary to pull a local stream).
+static void makeSnapInternal(const string &play_url, const string &save_path,
+                              float timeout_sec, const FFmpegSnap::onSnap &cb);
+
+static void makeSnapAsync(const string &play_url, const string &save_path, float timeout_sec, const FFmpegSnap::onSnap &cb) {
+    struct Holder {
+        MediaPlayer::Ptr player;
+    };
+    auto holder = std::make_shared<Holder>();
+    auto player = std::make_shared<MediaPlayer>();
+    (*player)[mediakit::Client::kTimeoutMS] = timeout_sec * 1000;
+
+    player->setOnPlayResult([holder, save_path, cb, timeout_sec](const SockException &ex) mutable {
+        onceToken token(nullptr, [&]() { holder->player = nullptr; });
+        auto video = ex ? nullptr : dynamic_pointer_cast<VideoTrack>(holder->player->getTrack(TrackVideo, false));
+        if (!video) {
+            cb(false, ex ? ex.what() : "none video track");
+            return;
+        }
+        auto decoder = std::make_shared<FFmpegDecoder>(video);
+        auto new_holder = std::make_shared<Holder>(*holder);
+        auto timer = EventPollerPool::Instance().getPoller()->doDelayTask(1000 * timeout_sec, [cb, new_holder]() {
+            // 防止解码失败导致播放器无法释放
+            new_holder->player = nullptr;
+            cb(false, "decode frame timeout");
+            return 0;
+        });
+        auto done = false;
+        decoder->setOnDecode([save_path, new_holder, cb, done, timer](const FFmpegFrame::Ptr &frame) mutable {
+            if (done) {
+                return;
+            }
+            onceToken token(nullptr, [&]() { new_holder->player = nullptr; timer->cancel(); done = true; });
+            auto ret = FFmpegUtils::saveFrame(frame, save_path.data());
+            cb(std::get<0>(ret), std::get<1>(ret));
+        });
+        video->addDelegate([decoder](const Frame::Ptr &frame) { return decoder->inputFrame(frame, false, true); });
+    });
+    player->play(play_url);
+    holder->player = std::move(player);
+}
+
+static void makeSnapInternal(const string &play_url, const string &save_path,
+                              float timeout_sec, const FFmpegSnap::onSnap &cb) {
+    // Parse the URL to extract vhost / app / stream
+    MediaInfo info(play_url);
+    // Bug #5 fix: only strip extension for http/https — RTMP names may contain dots
+    auto stream_id = stripStreamExt(info.schema, info.stream);
+
+    // Find the already-running MediaSource (no new connection)
+    auto src = MediaSource::find(info.vhost, info.app, stream_id, false);
+    if (!src) {
+        WarnL << "makeSnapInternal: stream not found (" << info.app << "/" << stream_id << "), falling back to sync";
+        makeSnapSync(play_url, save_path, timeout_sec, cb);
+        return;
+    }
+
+    auto muxer = src->getMuxer();
+    if (!muxer) {
+        WarnL << "makeSnapInternal: no muxer, falling back to sync";
+        makeSnapSync(play_url, save_path, timeout_sec, cb);
+        return;
+    }
+
+    // Bug #7 fix: use muxer->getTracks() directly to avoid TOCTOU null-deref
+    // if the stream is torn down between getMuxer() and getTrack()
+    VideoTrack::Ptr track;
+    for (auto &t : muxer->getTracks(true)) {
+        if (t->getTrackType() == TrackVideo) {
+            track = dynamic_pointer_cast<VideoTrack>(t);
+            break;
+        }
+    }
+    if (!track) {
+        WarnL << "makeSnapInternal: video track not ready, falling back to sync";
+        makeSnapSync(play_url, save_path, timeout_sec, cb);
+        return;
+    }
+
+    // Drain the GOP cache into a local vector (brief mutex hold, then release)
+    vector<Frame::Ptr> gop_frames;
+    muxer->flushGop([&](const Frame::Ptr &frame) {
+        if (frame->getTrackType() == TrackVideo) {
+            gop_frames.push_back(frame);
+        }
+    });
+
+    if (gop_frames.empty()) {
+        WarnL << "makeSnapInternal: GOP cache empty, falling back to sync";
+        makeSnapSync(play_url, save_path, timeout_sec, cb);
+        return;
+    }
+
+    InfoL << "makeSnapInternal: decoding " << gop_frames.size()
+          << " cached frames for " << info.app << "/" << stream_id;
+
+    // Bug #4 fix: offload decode + encode to WorkThreadPool to avoid blocking the
+    // HTTP EventPoller thread (mirrors the makeSnapSync offload pattern).
+    // Wrap gop_frames in shared_ptr to move it into the lambda (C++11 compatible).
+    auto frames_ptr = make_shared<vector<Frame::Ptr>>(std::move(gop_frames));
+    WorkThreadPool::Instance().getPoller()->async(
+        [track, frames_ptr, save_path, cb]() {
+            auto &gop_frames = *frames_ptr;
+            // Bug #3 fix: wrap all decode work in try/catch so cb is always called
+            try {
+                auto decoder = make_shared<FFmpegDecoder>(track);
+                auto done = make_shared<bool>(false);
+
+                // setOnDecode must NOT capture decoder (decoder→callback→decoder cycle)
+                decoder->setOnDecode([done, save_path, cb](const FFmpegFrame::Ptr &frame) mutable {
+                    if (*done) return;
+                    *done = true;
+                    auto ret = FFmpegUtils::saveFrame(frame, save_path.data());
+                    cb(get<0>(ret), get<1>(ret));
+                });
+
+                for (auto &f : gop_frames) {
+                    if (*done) break;
+                    decoder->inputFrame(f, false, false);
+                }
+
+                // Bug #1 fix: flush() now calls _merger.flush() + drains avcodec,
+                // ensuring a keyframe buffered only in FrameMerger is decoded
+                if (!*done) {
+                    decoder->flush();
+                }
+
+                // Bug #2 fix: set *done = true BEFORE calling cb(false, ...) so
+                // the decoder destructor's flush() path sees the guard and won't
+                // fire cb a second time
+                if (!*done) {
+                    *done = true;
+                    cb(false, "makeSnapInternal: no decodable frame in GOP cache");
+                }
+
+            } catch (const exception &e) {
+                cb(false, string("makeSnapInternal failed: ") + e.what());
+            }
+        });
+}
+
+#endif
+
+void FFmpegSnap::makeSnap(bool async, const string &play_url, const string &save_path, float timeout_sec, const onSnap &cb) {
+#if defined(ENABLE_FFMPEG)
+    if (async) {
+        makeSnapAsync(play_url, save_path, timeout_sec, cb);
+        return;
+    } else {
+        if (isLocalUrl(play_url)) {
+            makeSnapInternal(play_url, save_path, timeout_sec, cb);
+            return;
+        }
+    }
+#endif
+
+    makeSnapSync(play_url, save_path, timeout_sec, cb);
 }
