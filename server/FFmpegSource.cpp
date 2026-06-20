@@ -415,7 +415,7 @@ static bool isLocalUrl(const std::string &url) {
     pos += 3;
     auto end = url.find_first_of("/:?#", pos);
     auto host = url.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
-    return host == "127.0.0.1" || host == "localhost" || host == "::1";
+    return host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]";
 }
 
 // Strip container extensions from HTTP stream names (.flv .ts .m3u8 .mp4).
