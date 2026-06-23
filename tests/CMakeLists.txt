@@ -66,3 +66,9 @@ if(TARGET test_rtp_pcap)
   target_include_directories(test_rtp_pcap SYSTEM PRIVATE ${PCAP_INCLUDE_DIRS})
   target_link_libraries(test_rtp_pcap  ${PCAP_LIBRARIES})
 endif()
+
+# Copy the snapshot regression-test fixture (a tiny MP4) next to the test binaries so
+# test_getsnap can locate it by default; it also accepts an explicit path as argv[1].
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_snap_fixture.mp4")
+  file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/test_snap_fixture.mp4" DESTINATION ${EXECUTABLE_OUTPUT_PATH})
+endif()
