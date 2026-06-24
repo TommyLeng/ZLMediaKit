@@ -67,6 +67,17 @@ if(TARGET test_rtp_pcap)
   target_link_libraries(test_rtp_pcap  ${PCAP_LIBRARIES})
 endif()
 
+# test_getsnap drives FFmpegSnap::makeSnap(), which lives in server/ rather than the
+# core library the tests link against. Pull in the few server sources it needs (none of
+# them define main()) and add the server include dir so the API entry point is callable.
+if(TARGET test_getsnap)
+  target_sources(test_getsnap PRIVATE
+    ${PROJECT_SOURCE_DIR}/server/FFmpegSource.cpp
+    ${PROJECT_SOURCE_DIR}/server/Process.cpp
+    ${PROJECT_SOURCE_DIR}/server/System.cpp)
+  target_include_directories(test_getsnap PRIVATE ${PROJECT_SOURCE_DIR}/server)
+endif()
+
 # Copy the snapshot regression-test fixture (a tiny MP4) next to the test binaries so
 # test_getsnap can locate it by default; it also accepts an explicit path as argv[1].
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_snap_fixture.mp4")
