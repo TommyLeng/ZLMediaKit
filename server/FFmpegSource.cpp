@@ -408,14 +408,15 @@ static void makeSnapSync(const string &play_url, const string &save_path, float 
 #include "Player/MediaPlayer.h"
 #include "Codec/Transcode.h"
 
-// Returns true if the URL host is the local ZLMediaKit instance (127.0.0.1 / localhost / ::1)
+// Returns true if the URL host is this ZLMediaKit instance (loopback or any local interface IP).
+// Delegates to is_local_ip(), so 127.0.0.1 / localhost / the machine's own LAN IP all qualify.
 static bool isLocalUrl(const std::string &url) {
     auto pos = url.find("://");
     if (pos == std::string::npos) return false;
     pos += 3;
     auto end = url.find_first_of("/:?#", pos);
     auto host = url.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
-    return host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]";
+    return is_local_ip(host);
 }
 
 // Strip container extensions from HTTP stream names (.flv .ts .m3u8 .mp4).
@@ -437,10 +438,13 @@ static std::string stripStreamExt(const std::string &schema, const std::string &
 
 // Fast snapshot path: directly access the GOP cache of an existing local stream.
 // No new network connection is made — uses ZLMediaKit's in-memory frame buffer.
-// Falls back to makeSnapAsync if stream not found or cache empty (always preferred over
-// spawning an external FFmpeg binary to pull a local stream).
+// On any failure (stream not found, no decodable cached frame, decode/encode error) it
+// invokes on_fallback() so the caller can retry via the normal path (makeSnapAsync /
+// makeSnapSync). cb is invoked only on a successful snapshot; every failure defers to
+// on_fallback, and the two are mutually exclusive.
 static void makeSnapInternal(const string &play_url, const string &save_path,
-                              float timeout_sec, const FFmpegSnap::onSnap &cb);
+                              float timeout_sec, const FFmpegSnap::onSnap &cb,
+                              const std::function<void()> &on_fallback);
 
 static void makeSnapAsync(const string &play_url, const string &save_path, float timeout_sec, const FFmpegSnap::onSnap &cb) {
     struct Holder {
@@ -481,7 +485,8 @@ static void makeSnapAsync(const string &play_url, const string &save_path, float
 }
 
 static void makeSnapInternal(const string &play_url, const string &save_path,
-                              float timeout_sec, const FFmpegSnap::onSnap &cb) {
+                              float timeout_sec, const FFmpegSnap::onSnap &cb,
+                              const std::function<void()> &on_fallback) {
     // Parse the URL to extract vhost / app / stream
     MediaInfo info(play_url);
     // Bug #5 fix: only strip extension for http/https — RTMP names may contain dots
@@ -490,15 +495,15 @@ static void makeSnapInternal(const string &play_url, const string &save_path,
     // Find the already-running MediaSource (no new connection)
     auto src = MediaSource::find(info.vhost, info.app, stream_id, false);
     if (!src) {
-        WarnL << "makeSnapInternal: stream not found (" << info.app << "/" << stream_id << "), falling back to sync";
-        makeSnapSync(play_url, save_path, timeout_sec, cb);
+        WarnL << "makeSnapInternal: stream not found (" << info.app << "/" << stream_id << "), falling back";
+        on_fallback();
         return;
     }
 
     auto muxer = src->getMuxer();
     if (!muxer) {
-        WarnL << "makeSnapInternal: no muxer, falling back to sync";
-        makeSnapSync(play_url, save_path, timeout_sec, cb);
+        WarnL << "makeSnapInternal: no muxer, falling back";
+        on_fallback();
         return;
     }
 
@@ -512,8 +517,8 @@ static void makeSnapInternal(const string &play_url, const string &save_path,
         }
     }
     if (!track) {
-        WarnL << "makeSnapInternal: video track not ready, falling back to sync";
-        makeSnapSync(play_url, save_path, timeout_sec, cb);
+        WarnL << "makeSnapInternal: video track not ready, falling back";
+        on_fallback();
         return;
     }
 
@@ -526,8 +531,8 @@ static void makeSnapInternal(const string &play_url, const string &save_path,
     });
 
     if (gop_frames.empty()) {
-        WarnL << "makeSnapInternal: GOP cache empty, falling back to sync";
-        makeSnapSync(play_url, save_path, timeout_sec, cb);
+        WarnL << "makeSnapInternal: GOP cache empty, falling back";
+        on_fallback();
         return;
     }
 
@@ -539,19 +544,28 @@ static void makeSnapInternal(const string &play_url, const string &save_path,
     // Wrap gop_frames in shared_ptr to move it into the lambda (C++11 compatible).
     auto frames_ptr = make_shared<vector<Frame::Ptr>>(std::move(gop_frames));
     WorkThreadPool::Instance().getPoller()->async(
-        [track, frames_ptr, save_path, cb]() {
+        [track, frames_ptr, save_path, cb, on_fallback]() {
             auto &gop_frames = *frames_ptr;
-            // Bug #3 fix: wrap all decode work in try/catch so cb is always called
+            // `done` is declared before the try so every exit path (success, no-frame,
+            // exception) can consult it and fire exactly one terminal action: either
+            // cb() on success, or on_fallback() on any failure — never both.
+            auto done = make_shared<bool>(false);
+            // Bug #3 fix: wrap all decode work in try/catch so a terminal action always runs
             try {
                 auto decoder = make_shared<FFmpegDecoder>(track);
-                auto done = make_shared<bool>(false);
 
                 // setOnDecode must NOT capture decoder (decoder→callback→decoder cycle)
-                decoder->setOnDecode([done, save_path, cb](const FFmpegFrame::Ptr &frame) mutable {
+                decoder->setOnDecode([done, save_path, cb, on_fallback](const FFmpegFrame::Ptr &frame) mutable {
                     if (*done) return;
                     *done = true;
                     auto ret = FFmpegUtils::saveFrame(frame, save_path.data());
-                    cb(get<0>(ret), get<1>(ret));
+                    if (get<0>(ret)) {
+                        cb(true, get<1>(ret));
+                    } else {
+                        // Decoded fine but couldn't encode/write the JPEG — defer to fallback.
+                        WarnL << "makeSnapInternal: saveFrame failed (" << get<1>(ret) << "), falling back";
+                        on_fallback();
+                    }
                 });
 
                 for (auto &f : gop_frames) {
@@ -565,16 +579,20 @@ static void makeSnapInternal(const string &play_url, const string &save_path,
                     decoder->flush();
                 }
 
-                // Bug #2 fix: set *done = true BEFORE calling cb(false, ...) so
-                // the decoder destructor's flush() path sees the guard and won't
-                // fire cb a second time
+                // Bug #2 fix: set *done = true BEFORE the fallback so the decoder
+                // destructor's flush() path sees the guard and won't fire twice
                 if (!*done) {
                     *done = true;
-                    cb(false, "makeSnapInternal: no decodable frame in GOP cache");
+                    WarnL << "makeSnapInternal: no decodable frame in GOP cache, falling back";
+                    on_fallback();
                 }
 
             } catch (const exception &e) {
-                cb(false, string("makeSnapInternal failed: ") + e.what());
+                if (!*done) {
+                    *done = true;
+                    WarnL << "makeSnapInternal: decode error (" << e.what() << "), falling back";
+                    on_fallback();
+                }
             }
         });
 }
@@ -583,14 +601,24 @@ static void makeSnapInternal(const string &play_url, const string &save_path,
 
 void FFmpegSnap::makeSnap(bool async, const string &play_url, const string &save_path, float timeout_sec, const onSnap &cb) {
 #if defined(ENABLE_FFMPEG)
+    // Local streams always take the zero-connection internal path (in-memory GOP cache),
+    // regardless of async — it is cheaper than both makeSnapAsync (spins up a MediaPlayer)
+    // and makeSnapSync (spawns an external FFmpeg). If the internal path can't serve the
+    // request it defers to the normal path below, honouring the original async choice.
+    if (isLocalUrl(play_url)) {
+        auto fallback = [async, play_url, save_path, timeout_sec, cb]() {
+            if (async) {
+                makeSnapAsync(play_url, save_path, timeout_sec, cb);
+            } else {
+                makeSnapSync(play_url, save_path, timeout_sec, cb);
+            }
+        };
+        makeSnapInternal(play_url, save_path, timeout_sec, cb, fallback);
+        return;
+    }
     if (async) {
         makeSnapAsync(play_url, save_path, timeout_sec, cb);
         return;
-    } else {
-        if (isLocalUrl(play_url)) {
-            makeSnapInternal(play_url, save_path, timeout_sec, cb);
-            return;
-        }
     }
 #endif
 
