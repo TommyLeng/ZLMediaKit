@@ -124,7 +124,7 @@ static void sig_crash(int sig) {
         }
     }
     string stack_info = ss.str();
-    ofstream out(StrPrinter << exeDir() << "/crash." << getpid(), ios::out | ios::binary | ios::trunc);
+    ofstream out(StrPrinter << exeDir() << "/log/crash." << getpid(), ios::out | ios::binary | ios::trunc);
     out << stack_info;
     out.flush();
     cerr << stack_info << endl;
