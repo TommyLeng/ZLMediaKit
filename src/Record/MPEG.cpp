@@ -56,13 +56,15 @@ bool MpegMuxer::inputFrame(const Frame::Ptr &frame) {
         case CodecH265: {
             // 这里的代码逻辑是让SPS、PPS、IDR这些时间戳相同的帧打包到一起当做一个帧处理，  [AUTO-TRANSLATED:edf57c32]
             // The code logic here is to package frames with the same timestamp, such as SPS, PPS, and IDR, together as one frame.
-            return track.merger.inputFrame(frame, [this, &track](uint64_t dts, uint64_t pts, const Buffer::Ptr &buffer, bool have_idr) {
+            auto track_id = track.track_id;
+            return track.merger.inputFrame(frame, [this, track_id](uint64_t dts, uint64_t pts, const Buffer::Ptr &buffer, bool have_idr) {
+                if (!_context) { return; }
                 _key_pos = have_idr;
                 // 取视频时间戳为TS的时间戳  [AUTO-TRANSLATED:5ff7796d]
                 // Take the video timestamp as the TS timestamp.
                 _timestamp = dts;
                 _max_cache_size = 512 + 1.2 * buffer->size();
-                mpeg_muxer_input((::mpeg_muxer_t *)_context, track.track_id, have_idr ? 0x0001 : 0, pts * 90LL, dts * 90LL, buffer->data(), buffer->size());
+                mpeg_muxer_input((::mpeg_muxer_t *)_context, track_id, have_idr ? 0x0001 : 0, pts * 90LL, dts * 90LL, buffer->data(), buffer->size());
                 flushCache();
             });
         }
@@ -143,6 +145,9 @@ void MpegMuxer::flushCache() {
 }
 
 void MpegMuxer::releaseContext() {
+    // Flush merger callbacks before destroying context and clearing tracks,
+    // so no callback fires with a dangling &track or null _context.
+    flush();
     if (_context) {
         mpeg_muxer_destroy((::mpeg_muxer_t *)_context);
         _context = nullptr;
