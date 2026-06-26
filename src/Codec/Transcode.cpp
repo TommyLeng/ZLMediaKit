@@ -490,13 +490,15 @@ FFmpegDecoder::FFmpegDecoder(const Track::Ptr &track, int thread_num, const std:
 
 FFmpegDecoder::~FFmpegDecoder() {
     stopThread(true);
-    if (_do_merger) {
-        _merger.flush();
-    }
     flush();
 }
 
 void FFmpegDecoder::flush() {
+    // First push any frames buffered in the merger into avcodec
+    if (_do_merger) {
+        _merger.flush();
+    }
+    // Then drain avcodec's internal output buffer
     while (true) {
         auto out_frame = _frame_pool.obtain2();
         auto ret = avcodec_receive_frame(_context.get(), out_frame->get());
