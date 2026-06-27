@@ -39,6 +39,10 @@ PSEncoderImp::PSEncoderImp(uint32_t ssrc, uint8_t payload_type, bool ps_or_ts) :
 }
 
 PSEncoderImp::~PSEncoderImp() {
+    // Flush any pending FrameMerger callback while our onWrite vtable slot is
+    // still valid. Without this, ~MpegMuxer()->releaseContext()->flush() would
+    // fire onWrite() as a pure-virtual call.
+    MpegMuxer::flush();
     InfoL << this;
 }
 
